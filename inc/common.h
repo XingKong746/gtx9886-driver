@@ -27,8 +27,6 @@ Environment:
 // defined especially to handle such requests.
 //
 #define  HIDMINI_CONTROL_CODE_SET_ATTRIBUTES              0x00
-#define  HIDMINI_CONTROL_CODE_DUMMY1                      0x01
-#define  HIDMINI_CONTROL_CODE_DUMMY2                      0x02
 
 //
 // This is the report id of the collection to which the control codes are sent
@@ -37,10 +35,10 @@ Environment:
 #define TEST_COLLECTION_REPORT_ID                         0x02
 
 #define MAXIMUM_STRING_LENGTH           (126 * sizeof(WCHAR))
-#define VHIDMINI_MANUFACTURER_STRING    L"UMDF Virtual hidmini device Manufacturer string"  
-#define VHIDMINI_PRODUCT_STRING         L"UMDF Virtual hidmini device Product string"  
-#define VHIDMINI_SERIAL_NUMBER_STRING   L"UMDF Virtual hidmini device Serial Number string"  
-#define VHIDMINI_DEVICE_STRING          L"UMDF Virtual hidmini device"  
+#define VHIDMINI_MANUFACTURER_STRING    L"Goodix"
+#define VHIDMINI_PRODUCT_STRING         L"GTX9886 Touchscreen Controller"
+#define VHIDMINI_SERIAL_NUMBER_STRING   L"0001"
+#define VHIDMINI_DEVICE_STRING          L"GTX9886 Touchscreen Controller Device"
 #define VHIDMINI_DEVICE_STRING_INDEX    5
 #include <pshpack1.h>
 

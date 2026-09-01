@@ -56,6 +56,12 @@ RequestGetHidXferPacket_ToReadFromDevice(
         return status;
     }
 
+    if (WdfRequestWdmGetIrp(Request)->UserBuffer == NULL) {
+        status = STATUS_INVALID_PARAMETER;
+        KdPrint(("RequestGetHidXferPacket: NULL UserBuffer\n"));
+        return status;
+    }
+
     RtlCopyMemory(Packet, WdfRequestWdmGetIrp(Request)->UserBuffer, sizeof(HID_XFER_PACKET));
     return STATUS_SUCCESS;
 }
@@ -75,6 +81,12 @@ RequestGetHidXferPacket_ToWriteToDevice(
     if (params.Parameters.DeviceIoControl.InputBufferLength < sizeof(HID_XFER_PACKET)) {
         status = STATUS_BUFFER_TOO_SMALL;
         KdPrint(("RequestGetHidXferPacket: invalid HID_XFER_PACKET\n"));
+        return status;
+    }
+
+    if (WdfRequestWdmGetIrp(Request)->UserBuffer == NULL) {
+        status = STATUS_INVALID_PARAMETER;
+        KdPrint(("RequestGetHidXferPacket: NULL UserBuffer\n"));
         return status;
     }
 

@@ -13,4 +13,9 @@
 #define VER_FILEDESCRIPTION_STR     "HID minidriver (KMDF version)"
 #define VER_INTERNALNAME_STR        "vhidmini.sys"
 
-#include "common.ver"
+// Version resource company / copyright strings (previously in common.ver)
+#ifdef VER_COMPANYNAME_STR
+#undef VER_COMPANYNAME_STR
+#endif
+#define VER_COMPANYNAME_STR         "KancyJoe"
+#define VER_LEGALCOPYRIGHT_STR      "Copyright (C) KancyJoe.  All rights reserved."

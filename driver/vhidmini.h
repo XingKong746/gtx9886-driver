@@ -37,9 +37,27 @@ Environment:
 
 typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 
+//
+// Touch input report (report ID 0x54) layout:
+//   reportId (1) + 10 contacts * 6 bytes (state, contact id, X lo/hi, Y lo/hi)
+//   + contact count (1) = 62 bytes.
+// Contact state byte: bit0 = tip switch, bit1 = in range, bit2 = confidence.
+//
+#define TOUCH_REPORT_SLOT_COUNT 3
+#define TOUCH_INPUT_REPORT_SIZE 62
+#define MAX_POINT_NUM 0xA
+
+typedef struct __declspec(align(2))
+{
+    BYTE  reportId;
+    BYTE  points[60];
+    BYTE  DIG_TouchScreenContactCount;
+} inputReport54_t;
+
+C_ASSERT(sizeof(inputReport54_t) == TOUCH_INPUT_REPORT_SIZE);
+
 DRIVER_INITIALIZE                   DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD           EvtDeviceAdd;
-EVT_WDF_TIMER                       EvtTimerFunc;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP      EvtDriverCleanup;
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE      OnPrepareHardware;
@@ -53,16 +71,17 @@ typedef struct _DEVICE_CONTEXT
     WDFQUEUE                DefaultQueue;
     WDFQUEUE                ManualQueue;
     HID_DEVICE_ATTRIBUTES   HidDeviceAttributes;
-    BYTE                    DeviceData;
     HID_DESCRIPTOR          HidDescriptor;
     PHID_REPORT_DESCRIPTOR  ReportDescriptor;
-    BOOLEAN                 ReadReportDescFromRegistry;
 
     LARGE_INTEGER           PeripheralId;
     WDFINTERRUPT            Interrupt;
     WDFIOTARGET             SpbController;
     BOOLEAN                 OnClose;
-    UINT8                   LastTouchID;
+    BOOLEAN                 LastActiveReportValid;
+    inputReport54_t         LastActiveReport;
+    UINT8                   ActiveIds[MAX_POINT_NUM];
+    UINT8                   ActiveCount;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext);
@@ -71,7 +90,6 @@ typedef struct _QUEUE_CONTEXT
 {
     WDFQUEUE                Queue;
     PDEVICE_CONTEXT         DeviceContext;
-    UCHAR                   OutputReport;
 
 } QUEUE_CONTEXT, *PQUEUE_CONTEXT;
 
@@ -87,7 +105,21 @@ typedef struct _MANUAL_QUEUE_CONTEXT
 {
     WDFQUEUE                Queue;
     PDEVICE_CONTEXT         DeviceContext;
-    WDFTIMER                Timer;
+
+    //
+    // Touch report delivery state machine. ReportLock serializes the ISR and
+    // the read-report path; PendingReports is a ring buffer of reports
+    // waiting for a HID read request. DeliveryInProgress guarantees only one
+    // delivery loop runs at a time; DeliveryIdleEvent is signaled whenever no
+    // delivery loop is active (used by OnD0Exit to wait out in-flight
+    // completions before deleting objects).
+    //
+    WDFSPINLOCK             ReportLock;
+    inputReport54_t         PendingReports[TOUCH_REPORT_SLOT_COUNT];
+    UCHAR                   PendingHead;
+    UCHAR                   PendingCount;
+    BOOLEAN                 DeliveryInProgress;
+    KEVENT                  DeliveryIdleEvent;
 
 } MANUAL_QUEUE_CONTEXT, *PMANUAL_QUEUE_CONTEXT;
 
@@ -180,7 +212,7 @@ OnInterruptIsr(
     _In_  ULONG        MessageID
 );
 
-VOID
+NTSTATUS
 SpbDeviceOpen(
     _In_  PDEVICE_CONTEXT  pDevice
 );
@@ -204,11 +236,7 @@ SpbDeviceWriteRead(
 );
 
 NTSTATUS
-ReadDescriptorFromRegistry(
-    WDFDEVICE Device
-);
-NTSTATUS
-CheckRegistryForDescriptor(
+ReadCoordinateConfigFromRegistry(
     WDFDEVICE Device
 );
 
@@ -221,6 +249,6 @@ CheckRegistryForDescriptor(
 // These are the device attributes returned by the mini driver in response
 // to IOCTL_HID_GET_DEVICE_ATTRIBUTES.
 //
-#define HIDMINI_PID             0xFEED
-#define HIDMINI_VID             0xDEED
-#define HIDMINI_VERSION         0x0101
+#define HIDMINI_PID             0x9886
+#define HIDMINI_VID             0x27C6
+#define HIDMINI_VERSION         0x0100
