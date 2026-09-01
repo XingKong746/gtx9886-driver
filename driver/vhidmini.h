@@ -22,7 +22,6 @@ Environment:
 #include <windows.h>
 #endif
 
-#include <ntddk.h>
 #include <wdm.h>
 #include <ntstrsafe.h>
 
@@ -258,13 +257,13 @@ SpbDeviceClose(
 VOID
 SpbDeviceWrite(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ const PVOID pInputBuffer,
+    _In_ const void* pInputBuffer,
     _In_ size_t inputBufferLength
 );
-VOID
+NTSTATUS
 SpbDeviceWriteRead(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ const PVOID pInputBuffer,
+    _In_ const void* pInputBuffer,
     _In_ PVOID pOutputBuffer,
     _In_ size_t inputBufferLength,
     _In_ size_t outputBufferLength

@@ -965,9 +965,10 @@ OnD0Exit(
     SpbDeviceClose(pDevice);
     //
     // Wait until any in-flight delivery loop has exited before deleting
-    // objects it may still be using. Bounded wait: a delivery loop never
-    // blocks, so a timeout here indicates a bug; continue rather than
-    // hang the PnP stack forever.
+    // objects it may still be using. A delivery loop never blocks, so a
+    // timeout here indicates the loop is wedged; fail the device and let
+    // the framework walk the removal path instead of tearing down objects
+    // a live loop may still be using.
     //
     timeout.QuadPart = -5 * 1000 * 1000 * 10;   // 5 seconds
 
@@ -1385,8 +1386,10 @@ CacheTouchReportLocked(
 
   Invariants:
     - Frames carrying tip-up slots (partial or full lifts) are never
-      dropped: they may only be overwritten by a newer lift when every
-      slot already holds a lift frame (practically unreachable).
+      dropped out of order: when the ring is full and every slot already
+      holds a lift frame, the OLDEST frame is discarded and the new lift
+      is appended at the tail, so FIFO delivery order is preserved and
+      the newest lift frames keep their UP signals.
     - Consecutive frames in the same state are coalesced only when
       neither frame carries tip-up slots.
     - Pure down frames are droppable: when the ring is full the newest
@@ -1439,12 +1442,13 @@ CacheTouchReportLocked(
     }
 
     //
-    // Lift frame: never drop it. Overwrite the most recent pure down slot,
-    // scanning from the tail towards (but never touching) the head. If the
-    // tail and middle slots are both lift frames, the head is the last
-    // candidate: sacrifice it when it is a pure down frame, and only fall
-    // back to overwriting the tail when every slot holds a lift frame
-    // (practically unreachable).
+    // Lift frame: never drop it out of order. First overwrite the newest
+    // pure down slot, scanning from the tail towards (but never touching)
+    // the head. When the tail and middle slots are both lift frames,
+    // discard the OLDEST frame by advancing the head and append the new
+    // lift at the tail. This keeps FIFO delivery order (the new lift is
+    // delivered last) and preserves every UP signal in the ring; a lost
+    // oldest-frame UP falls back to contact-disappearance detection.
     //
     for (UCHAR back = 0; back < TOUCH_REPORT_SLOT_COUNT - 1; back++) {
         reportIndex = (QueueContext->PendingHead + TOUCH_REPORT_SLOT_COUNT - 1 - back) %
@@ -1454,14 +1458,8 @@ CacheTouchReportLocked(
             return;
         }
     }
-    if (!TouchReportHasLifted(&QueueContext->PendingReports[QueueContext->PendingHead])) {
-        //
-        // The head is a pure down frame and therefore droppable: replace it
-        // with the new lift instead of losing another lift frame.
-        //
-        RtlCopyMemory(&QueueContext->PendingReports[QueueContext->PendingHead], Report, sizeof(*Report));
-        return;
-    }
+    QueueContext->PendingHead =
+        (QueueContext->PendingHead + 1) % TOUCH_REPORT_SLOT_COUNT;
     reportIndex = (QueueContext->PendingHead + TOUCH_REPORT_SLOT_COUNT - 1) %
         TOUCH_REPORT_SLOT_COUNT;
     RtlCopyMemory(&QueueContext->PendingReports[reportIndex], Report, sizeof(*Report));
@@ -2248,6 +2246,17 @@ Return Value:
                             &queueConfig,
                             WdfIoQueueDispatchManual);
 
+    //
+    // Note on queue power management: PowerManaged stays WdfUseDefault,
+    // which resolves to NOT power-managed for this queue because the
+    // driver calls WdfFdoInitSetFilter (see WDF_IO_QUEUE_CONFIG). Parked
+    // read requests therefore cannot survive across D0 cycles by other
+    // means: hidclass cancels its outstanding reads on power-down before
+    // this filter's EvtDeviceD0Exit runs (power IRPs travel top-down), and
+    // the framework completes any remaining queued requests at device
+    // removal. No explicit purge is needed.
+    //
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(
                             &queueAttributes,
                             MANUAL_QUEUE_CONTEXT);
@@ -2385,6 +2394,16 @@ OnInterruptIsr(
             KdPrint(("GTX9886: unserviced firmware request event 0x%02X\n",
                 preBuffer[0]));
         }
+        //
+        // A packet carrying no known event flag is not ours: report the
+        // interrupt as unrecognized so other devices on a shared line can
+        // be serviced. clean_coor below still runs unconditionally to
+        // release the level-triggered line and prevent an interrupt storm.
+        // REQUEST/GESTURE/HOTKNOT packets are ours and stay recognized.
+        //
+        fInterruptRecognized =
+            ((preBuffer[0] & (GOODIX_TOUCH_EVENT | GOODIX_REQUEST_EVENT |
+                              GOODIX_GESTURE_EVENT | GOODIX_HOTKNOT_EVENT)) != 0);
         goto exit;
     }
 
@@ -2402,9 +2421,16 @@ OnInterruptIsr(
     //
     RtlCopyMemory(allBuf, &preBuffer[2], sizeof(preBuffer) - 2);
     if (touch_count > 1) {
-        SpbDeviceWriteRead(pDevice, gtx9886_get_coor, &allBuf[10],
-            sizeof(gtx9886_get_coor),
-            BYTES_PER_COORD * (touch_count - 1));
+        if (!NT_SUCCESS(SpbDeviceWriteRead(pDevice, gtx9886_get_coor, &allBuf[10],
+                sizeof(gtx9886_get_coor),
+                BYTES_PER_COORD * (touch_count - 1)))) {
+            //
+            // The follow-up read failed; allBuf[10..] is still zeroed and
+            // would be parsed as phantom contacts at (0,0). Drop the frame.
+            //
+            KdPrint(("GTX9886: multi-contact read failed, dropping frame\n"));
+            goto exit;
+        }
     }
 
     readReport.DIG_TouchScreenContactCount = touch_count;
@@ -2593,9 +2619,6 @@ OnInterruptIsr(
             requestRetrieved = TRUE;
         }
     }
-    else {
-        status = STATUS_NO_MORE_ENTRIES;
-    }
     WdfSpinLockRelease(queueContext->ReportLock);
 
     if (requestRetrieved) {
@@ -2603,6 +2626,10 @@ OnInterruptIsr(
     }
 
 exit:
+    //
+    // Always acknowledge (and thereby release the level-triggered line),
+    // even for packets we did not recognize.
+    //
     SpbDeviceWrite(pDevice, gtx9886_clean_coor, sizeof(gtx9886_clean_coor));
     return fInterruptRecognized;
 }
@@ -2759,10 +2786,12 @@ SpbDeviceAcquireSlot(
         if (KeWaitForSingleObject(&slot->Event, Executive, KernelMode, FALSE,
                 &timeout) != STATUS_TIMEOUT) {
             //
-            // The hung request has terminated; its slot is reusable.
+            // The hung request has terminated; delete its object (and its
+            // child memory object) and reuse the slot. The slot is already
+            // marked InUse, so it can be handed out directly.
             //
+            WdfObjectDelete(slot->Request);
             slot->Request = WDF_NO_HANDLE;
-            slot->InUse = TRUE;
             return slot;
         }
     }
@@ -2844,7 +2873,7 @@ SpbDeviceSendAndWait(
 static NTSTATUS
 SpbDeviceWriteWithTimeout(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ const PVOID pInputBuffer,
+    _In_ const void* pInputBuffer,
     _In_ size_t inputBufferLength
 )
 {
@@ -2986,7 +3015,7 @@ SpbDeviceReadWithTimeout(
 VOID
 SpbDeviceWrite(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ const PVOID pInputBuffer,
+    _In_ const void* pInputBuffer,
     _In_ size_t inputBufferLength
 )
 {
@@ -2999,10 +3028,10 @@ SpbDeviceWrite(
     }
 }
 
-VOID
+NTSTATUS
 SpbDeviceWriteRead(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ const PVOID pInputBuffer,
+    _In_ const void* pInputBuffer,
     _In_ PVOID pOutputBuffer,
     _In_ size_t inputBufferLength,
     _In_ size_t outputBufferLength
@@ -3014,14 +3043,17 @@ SpbDeviceWriteRead(
     if (!NT_SUCCESS(status))
     {
         KdPrint(("GTX9886: SpbDeviceWriteRead (write) failed 0x%08X\n", status));
-        return;
+        return status;
     }
 
     status = SpbDeviceReadWithTimeout(pDevice, pOutputBuffer, outputBufferLength);
     if (!NT_SUCCESS(status))
     {
         KdPrint(("GTX9886: SpbDeviceWriteRead (read) failed 0x%08X\n", status));
+        return status;
     }
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -3050,6 +3082,7 @@ Return Value:
     UNICODE_STRING  yMinName;
     UNICODE_STRING  yMaxName;
     NTSTATUS        queryStatus;
+    ULONG           queryCount = 0;
     ULONG           queryFailures = 0;
     PDEVICE_CONTEXT deviceContext = GetDeviceContext(Device);
 
@@ -3075,24 +3108,39 @@ Return Value:
         // populated registry does not go unnoticed.
         //
         queryStatus = WdfRegistryQueryULong(hKey, &xRevertName, &deviceContext->XRevert);
+        queryCount++;
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
         queryStatus = WdfRegistryQueryULong(hKey, &yRevertName, &deviceContext->YRevert);
+        queryCount++;
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
         queryStatus = WdfRegistryQueryULong(hKey, &xYExchangeName, &deviceContext->XYExchange);
+        queryCount++;
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
         queryStatus = WdfRegistryQueryULong(hKey, &xMinName, &deviceContext->XMin);
+        queryCount++;
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
         queryStatus = WdfRegistryQueryULong(hKey, &xMaxName, &deviceContext->XMax);
+        queryCount++;
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
         queryStatus = WdfRegistryQueryULong(hKey, &yMinName, &deviceContext->YMin);
+        queryCount++;
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
         queryStatus = WdfRegistryQueryULong(hKey, &yMaxName, &deviceContext->YMax);
+        queryCount++;
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
 
         if (queryFailures != 0) {
-            KdPrint(("GTX9886: %lu coordinate registry value(s) missing, using defaults\n",
-                queryFailures));
-            status = queryStatus;
+            //
+            // A partially populated key falls back to the defaults and
+            // still counts as success; only a completely unpopulated key
+            // is an error, so the log line in EvtDeviceAdd reflects a
+            // real misconfiguration.
+            //
+            KdPrint(("GTX9886: %lu of %lu coordinate registry value(s) missing, using defaults\n",
+                queryFailures, queryCount));
+            status = (queryFailures == queryCount)
+                ? STATUS_NOT_FOUND
+                : STATUS_SUCCESS;
         }
 
         //
