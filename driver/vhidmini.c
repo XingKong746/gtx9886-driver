@@ -49,9 +49,15 @@ TransformPoint(
 )
 {
     ULONG xMin, xMax, yMin, yMax;
-    ULONG x = (ULONG)*pX;
-    ULONG y = (ULONG)*pY;
-    ULONG t;
+    ULONG x, y, t;
+
+    //
+    // Hardware coordinates are unsigned 12-bit values. Defensively treat
+    // any negative input as zero so clamping lands on the minimum edge
+    // instead of wrapping around to the maximum edge.
+    //
+    x = (*pX < 0) ? 0 : (ULONG)*pX;
+    y = (*pY < 0) ? 0 : (ULONG)*pY;
 
     //
     // If the axes are exchanged, the reported X axis corresponds to
@@ -2351,11 +2357,17 @@ OnInterruptIsr(
     // Only TOUCH events carry point data; request/gesture/hotknot packets
     // must not be parsed as coordinates. NOTE: a REQUEST event (0x40) is
     // acknowledged (clean_coor below) without being serviced because the
-    // firmware request protocol is unknown. If the firmware stalls after
-    // request events stop being delivered, this is the place to fix.
+    // firmware request protocol is unknown. Log it (rate-limited) so a
+    // future firmware-protocol investigation has a starting point.
     //
-    if ((preBuffer[0] & GOODIX_TOUCH_EVENT) != GOODIX_TOUCH_EVENT)
+    if ((preBuffer[0] & GOODIX_TOUCH_EVENT) != GOODIX_TOUCH_EVENT) {
+        if ((preBuffer[0] & GOODIX_REQUEST_EVENT) &&
+            ((++pDevice->RequestEventLogCount % 64) == 1)) {
+            KdPrint(("GTX9886: unserviced firmware request event 0x%02X\n",
+                preBuffer[0]));
+        }
         goto exit;
+    }
 
     BYTE touch_count = preBuffer[1] & 0x0F;
     if (touch_count > MAX_POINT_NUM)

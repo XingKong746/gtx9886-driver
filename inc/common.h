@@ -21,20 +21,10 @@ Environment:
 #define __VHIDMINI_COMMON_H__
 
 //
-// Custom control codes are defined here. They are to be used for sideband 
-// communication with the hid minidriver. These control codes are sent to 
-// the hid minidriver using Hid_SetFeature() API to a custom collection 
-// defined especially to handle such requests.
-//
-#define  HIDMINI_CONTROL_CODE_SET_ATTRIBUTES              0x00
-
-//
-// This is the report id of the collection to which the control codes are sent
+// Report ID of the touch collection (see the HID report descriptor).
 //
 #define CONTROL_COLLECTION_REPORT_ID                      0x54
-#define TEST_COLLECTION_REPORT_ID                         0x02
 
-#define MAXIMUM_STRING_LENGTH           (126 * sizeof(WCHAR))
 #define VHIDMINI_MANUFACTURER_STRING    L"Goodix"
 #define VHIDMINI_PRODUCT_STRING         L"GTX9886 Touchscreen Controller"
 #define VHIDMINI_SERIAL_NUMBER_STRING   L"0001"
@@ -42,60 +32,17 @@ Environment:
 #define VHIDMINI_DEVICE_STRING_INDEX    5
 #include <pshpack1.h>
 
-
-typedef struct _MY_DEVICE_ATTRIBUTES {
-
-    USHORT          VendorID;
-    USHORT          ProductID;
-    USHORT          VersionNumber;
-
-} MY_DEVICE_ATTRIBUTES, *PMY_DEVICE_ATTRIBUTES;
-
-typedef struct _HIDMINI_CONTROL_INFO {
-
-    //
-    //report ID of the collection to which the control request is sent
-    //
-    UCHAR    ReportId;   
-
-    //
-    // One byte control code (user-defined) for communication with hid 
-    // mini driver
-    //
-    UCHAR   ControlCode;
-
-    //
-    // This union contains input data for the control request.
-    //
-    union {
-        MY_DEVICE_ATTRIBUTES Attributes;
-        struct {
-            ULONG Dummy1;
-            ULONG Dummy2;
-        } Dummy;
-    } u;
-    
-} HIDMINI_CONTROL_INFO, * PHIDMINI_CONTROL_INFO;
-
 //
-// input from device to system
-//
-typedef struct _HIDMINI_INPUT_REPORT {
-    
-    UCHAR ReportId;   
-
-    UCHAR Data; 
-
-} HIDMINI_INPUT_REPORT, *PHIDMINI_INPUT_REPORT;
-
-//
-// output to device from system
+// Output report from system to device. The touch report descriptor has
+// no writable output data, but this legacy sample structure's size is
+// still used to validate and acknowledge IOCTL_HID_WRITE_REPORT and
+// IOCTL_HID_SET_OUTPUT_REPORT.
 //
 typedef struct _HIDMINI_OUTPUT_REPORT {
-    
-    UCHAR ReportId;   
 
-    UCHAR Data; 
+    UCHAR ReportId;
+
+    UCHAR Data;
 
     USHORT Pad1;
 
@@ -104,15 +51,5 @@ typedef struct _HIDMINI_OUTPUT_REPORT {
 } HIDMINI_OUTPUT_REPORT, *PHIDMINI_OUTPUT_REPORT;
 
 #include <poppack.h>
-
-//
-// SetFeature request requires that the feature report buffer size be exactly 
-// same as the size of report described in the hid report descriptor (
-// excluding the report ID). Since HIDMINI_CONTROL_INFO includes report ID,
-// we subtract one from the size.
-//
-#define FEATURE_REPORT_SIZE_CB      ((USHORT)(sizeof(HIDMINI_CONTROL_INFO) - 1))
-#define INPUT_REPORT_SIZE_CB        ((USHORT)(sizeof(HIDMINI_INPUT_REPORT) - 1))
-#define OUTPUT_REPORT_SIZE_CB       ((USHORT)(sizeof(HIDMINI_OUTPUT_REPORT) - 1))
 
 #endif //__VHIDMINI_COMMON_H__

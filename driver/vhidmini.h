@@ -99,6 +99,7 @@ typedef struct _DEVICE_CONTEXT
     UINT8                   ActiveIds[MAX_POINT_NUM];
     UINT8                   ActiveCount;
     SPB_SYNC_SLOT           SpbSlots[SPB_MAX_INFLIGHT];
+    ULONG                   RequestEventLogCount;
 
     //
     // Per-instance coordinate configuration (read from the device
