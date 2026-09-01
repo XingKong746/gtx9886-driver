@@ -1,0 +1,16 @@
+<Project>
+  <!--
+    Shared build settings, auto-loaded by MSBuild before the project file.
+
+    WindowsTargetPlatformVersion pins the SDK/WDK build folder. VS2022 pairs
+    with WDK/SDK 26100 (MSBuild task DLL = ...Build.Tasks.17.0.dll).
+    Switch to 10.0.28000.0 only when building with VS2026.
+
+    SkipPackageVerification bypasses the InfVerif step: WDK 28000 lacks the
+    x86 InfVerif tooling (0x8007007E). StampInf / Inf2Cat / signing still run.
+  -->
+  <PropertyGroup>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
+</Project>
