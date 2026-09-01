@@ -46,6 +46,21 @@ typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 #define TOUCH_REPORT_SLOT_COUNT 3
 #define TOUCH_INPUT_REPORT_SIZE 62
 #define MAX_POINT_NUM 0xA
+#define TOUCH_REPORT_DESCRIPTOR_SIZE 554
+
+//
+// Per-request synchronization slot for bounded-wait SPB transfers. Each
+// slot owns its event, so a request that stays in flight after a timeout
+// can never signal (and thereby falsely wake) a later request's wait.
+// Slots are only touched from the serialized passive-level ISR, so no
+// additional locking is needed.
+//
+#define SPB_MAX_INFLIGHT 4
+
+typedef struct _SPB_SYNC_SLOT {
+    KEVENT                  Event;
+    BOOLEAN                 InUse;
+} SPB_SYNC_SLOT;
 
 typedef struct __declspec(align(2))
 {
@@ -73,6 +88,7 @@ typedef struct _DEVICE_CONTEXT
     HID_DEVICE_ATTRIBUTES   HidDeviceAttributes;
     HID_DESCRIPTOR          HidDescriptor;
     PHID_REPORT_DESCRIPTOR  ReportDescriptor;
+    HID_REPORT_DESCRIPTOR   ReportDescriptorStorage[TOUCH_REPORT_DESCRIPTOR_SIZE];
 
     LARGE_INTEGER           PeripheralId;
     WDFINTERRUPT            Interrupt;
@@ -82,6 +98,19 @@ typedef struct _DEVICE_CONTEXT
     inputReport54_t         LastActiveReport;
     UINT8                   ActiveIds[MAX_POINT_NUM];
     UINT8                   ActiveCount;
+    SPB_SYNC_SLOT           SpbSlots[SPB_MAX_INFLIGHT];
+
+    //
+    // Per-instance coordinate configuration (read from the device
+    // registry key at EvtDeviceAdd).
+    //
+    ULONG                   XRevert;
+    ULONG                   YRevert;
+    ULONG                   XYExchange;
+    ULONG                   XMin;
+    ULONG                   XMax;
+    ULONG                   YMin;
+    ULONG                   YMax;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext);

@@ -28,27 +28,22 @@ Environment:
 #define GOODIX_HOTKNOT_EVENT    0x10
 #define BYTES_PER_COORD 0x8
 #define BYTES_CHKSUM 0x2
+#define SPB_TRANSFER_TIMEOUT_MS   100
+#define SPB_CANCEL_TIMEOUT_MS     100
 
 BYTE gtx9886_get_pre_coor[2] = { 0x41, 0x00 };
 BYTE gtx9886_get_coor[2] = { 0x41, 0x0c };
 BYTE gtx9886_clean_coor[3] = { 0x41, 0x00, 0x00};
 
-ULONG XRevert = 0;
-ULONG YRevert = 0;
-ULONG XYExchange = 0;
-ULONG XMin = 0;
-ULONG XMax = 1080;
-ULONG YMin = 0;
-ULONG YMax = 2340;
-
 //
 // Transform one touch point from the panel coordinate space to the
-// reported HID coordinate space according to the registry-configured
-// flags (XRevert / YRevert / XYExchange). Points are clamped to the
-// configured panel bounds first.
+// reported HID coordinate space according to the per-instance registry
+// configuration (XRevert / YRevert / XYExchange). Points are clamped to
+// the configured panel bounds first.
 //
 static VOID
 TransformPoint(
+    _In_ PDEVICE_CONTEXT pDevice,
     _Inout_ int* pX,
     _Inout_ int* pY
 )
@@ -62,14 +57,14 @@ TransformPoint(
     // If the axes are exchanged, the reported X axis corresponds to
     // the panel's Y axis, so the bounds must be swapped as well.
     //
-    if (XYExchange) {
+    if (pDevice->XYExchange) {
         t = x; x = y; y = t;
-        xMin = YMin; xMax = YMax;
-        yMin = XMin; yMax = XMax;
+        xMin = pDevice->YMin; xMax = pDevice->YMax;
+        yMin = pDevice->XMin; yMax = pDevice->XMax;
     }
     else {
-        xMin = XMin; xMax = XMax;
-        yMin = YMin; yMax = YMax;
+        xMin = pDevice->XMin; xMax = pDevice->XMax;
+        yMin = pDevice->YMin; yMax = pDevice->YMax;
     }
 
     if (x < xMin) x = xMin;
@@ -77,8 +72,8 @@ TransformPoint(
     if (y < yMin) y = yMin;
     if (y > yMax) y = yMax;
 
-    if (XRevert) x = xMax + xMin - x;
-    if (YRevert) y = yMax + yMin - y;
+    if (pDevice->XRevert) x = xMax + xMin - x;
+    if (pDevice->YRevert) y = yMax + yMin - y;
 
     *pX = (int)x;
     *pY = (int)y;
@@ -141,7 +136,7 @@ ClearTouchReports(
     0xC0,                           // END_COLLECTION
 };*/
 
-HID_REPORT_DESCRIPTOR       G_DefaultReportDescriptor[] = {
+const HID_REPORT_DESCRIPTOR G_DefaultReportDescriptor[] = {
     0x05, 0x0D,     // (GLOBAL) USAGE_PAGE         0x000D Digitizer Device Page
     0x09, 0x04,     //   (LOCAL)USAGE              0x000D0004 Touch Screen(Application Collection)
     0xA1, 0x01,     //   (MAIN)COLLECTION         0x01 Application(Usage = 0x000D0004: Page = Digitizer Device Page, Usage = Touch Screen, Type = Application Collection)
@@ -429,6 +424,8 @@ HID_REPORT_DESCRIPTOR       G_DefaultReportDescriptor[] = {
 
 };
 
+C_ASSERT(sizeof(G_DefaultReportDescriptor) == TOUCH_REPORT_DESCRIPTOR_SIZE);
+
 featureReport54_t features = {0x54,10};
 //
 // This is the default HID descriptor returned by the mini driver
@@ -590,6 +587,22 @@ Return Value:
     deviceContext->SpbController = WDF_NO_HANDLE;
     deviceContext->LastActiveReportValid = FALSE;
     deviceContext->ActiveCount = 0;
+    for (ULONG i = 0; i < SPB_MAX_INFLIGHT; i++) {
+        KeInitializeEvent(&deviceContext->SpbSlots[i].Event, NotificationEvent, FALSE);
+        deviceContext->SpbSlots[i].InUse = FALSE;
+    }
+
+    //
+    // Default coordinate configuration; the device registry key may
+    // override these in ReadCoordinateConfigFromRegistry.
+    //
+    deviceContext->XRevert = 0;
+    deviceContext->YRevert = 0;
+    deviceContext->XYExchange = 0;
+    deviceContext->XMin = 0;
+    deviceContext->XMax = 1080;
+    deviceContext->YMin = 0;
+    deviceContext->YMax = 2340;
 
     hidAttributes = &deviceContext->HidDeviceAttributes;
     RtlZeroMemory(hidAttributes, sizeof(HID_DEVICE_ATTRIBUTES));
@@ -629,23 +642,29 @@ Return Value:
     }
 
     //
-    // Patch the X/Y logical maximum of every finger collection. The
-    // first finger collection stores its X max value bytes at offset
-    // 46/47 and Y max at 55/56; each subsequent collection starts 53
-    // bytes later. When the axes are exchanged, the maxima are swapped
-    // so the descriptor matches the transformed report data.
+    // Copy the template descriptor into per-instance storage and patch the
+    // X/Y logical maximum of every finger collection. The first finger
+    // collection stores its X max value bytes at offset 46/47 and Y max at
+    // 55/56; each subsequent collection starts 53 bytes later. When the
+    // axes are exchanged, the maxima are swapped so the descriptor matches
+    // the transformed report data.
     //
-    ULONG descXMax = XYExchange ? YMax : XMax;
-    ULONG descYMax = XYExchange ? XMax : YMax;
+    RtlCopyMemory(
+        deviceContext->ReportDescriptorStorage,
+        G_DefaultReportDescriptor,
+        sizeof(deviceContext->ReportDescriptorStorage));
+
+    ULONG descXMax = deviceContext->XYExchange ? deviceContext->YMax : deviceContext->XMax;
+    ULONG descYMax = deviceContext->XYExchange ? deviceContext->XMax : deviceContext->YMax;
 
     for (ULONG i = 0; i < 10; i++) {
-        G_DefaultReportDescriptor[46 + 53 * i] = (BYTE)(descXMax & 0xFF);
-        G_DefaultReportDescriptor[47 + 53 * i] = (BYTE)((descXMax >> 8) & 0x0F);
-        G_DefaultReportDescriptor[55 + 53 * i] = (BYTE)(descYMax & 0xFF);
-        G_DefaultReportDescriptor[56 + 53 * i] = (BYTE)((descYMax >> 8) & 0x0F);
+        deviceContext->ReportDescriptorStorage[46 + 53 * i] = (BYTE)(descXMax & 0xFF);
+        deviceContext->ReportDescriptorStorage[47 + 53 * i] = (BYTE)((descXMax >> 8) & 0x0F);
+        deviceContext->ReportDescriptorStorage[55 + 53 * i] = (BYTE)(descYMax & 0xFF);
+        deviceContext->ReportDescriptorStorage[56 + 53 * i] = (BYTE)((descYMax >> 8) & 0x0F);
     }
 
-    deviceContext->ReportDescriptor = G_DefaultReportDescriptor;
+    deviceContext->ReportDescriptor = deviceContext->ReportDescriptorStorage;
     status = STATUS_SUCCESS;
 
     return status;
@@ -1747,9 +1766,9 @@ SetFeature(
 
 Routine Description:
 
-    Handles IOCTL_HID_SET_FEATURE for all the collection.
-    For control collection (custom defined collection) it handles
-    the user-defined control codes for sideband communication
+    Handles IOCTL_HID_SET_FEATURE for the touch collection. The feature
+    report (report ID 0x54) carries only the read-only Contact Count
+    Maximum, so there is no writable state: accept and ignore.
 
 Arguments:
 
@@ -1766,8 +1785,7 @@ Return Value:
     NTSTATUS                status;
     HID_XFER_PACKET         packet;
     ULONG                   reportSize;
-    PHIDMINI_CONTROL_INFO   controlInfo;
-    PHID_DEVICE_ATTRIBUTES  hidAttributes = &QueueContext->DeviceContext->HidDeviceAttributes;
+    UNREFERENCED_PARAMETER(QueueContext);
 
     status = RequestGetHidXferPacket_ToWriteToDevice(
                             Request,
@@ -1783,44 +1801,20 @@ Return Value:
         //
         status = STATUS_INVALID_PARAMETER;
         
-        
         return status;
     }
 
     //
-    // before touching control code make sure buffer is big enough.
+    // Feature payload is one byte (Contact Count Maximum) after the
+    // report ID. Nothing to do with it: acknowledge and return success.
     //
-    reportSize = sizeof(HIDMINI_CONTROL_INFO);
-
+    reportSize = 2;
     if (packet.reportBufferLen < reportSize) {
         status = STATUS_INVALID_BUFFER_SIZE;
-        
-        
         return status;
     }
 
-    controlInfo = (PHIDMINI_CONTROL_INFO)packet.reportBuffer;
-
-    switch(controlInfo->ControlCode)
-    {
-    case HIDMINI_CONTROL_CODE_SET_ATTRIBUTES:
-        //
-        // Store the device attributes in device extension
-        //
-        hidAttributes->ProductID     = controlInfo->u.Attributes.ProductID;
-        hidAttributes->VendorID      = controlInfo->u.Attributes.VendorID;
-        hidAttributes->VersionNumber = controlInfo->u.Attributes.VersionNumber;
-
-        //
-        // set status and information
-        //
-        WdfRequestSetInformation(Request, reportSize);
-        break;
-
-    default:
-        status = STATUS_NOT_IMPLEMENTED;
-        break;
-    }
+    WdfRequestSetInformation(Request, reportSize);
     return status;
 }
 
@@ -2416,7 +2410,7 @@ OnInterruptIsr(
         x = preBuffer[3] | (preBuffer[4] << 8);
         y = preBuffer[5] | (preBuffer[6] << 8);
         touchId = preBuffer[2] & 0x0F;
-        TransformPoint(&x, &y);
+        TransformPoint(pDevice, &x, &y);
         readReport.points[0] = 0x07;  // In Point
         readReport.points[1] = touchId;
         readReport.points[2] = x & 0xFF;
@@ -2441,7 +2435,7 @@ OnInterruptIsr(
             touchId = (allBuf[0 + i * 8] & 0x0F);
             x = allBuf[1 + i * 8] | (allBuf[2 + i * 8] << 8);
             y = allBuf[3 + i * 8] | (allBuf[4 + i * 8] << 8);
-            TransformPoint(&x, &y);
+            TransformPoint(pDevice, &x, &y);
             readReport.points[i * 6 + 0] = 0x07;  // In Point
             readReport.points[i * 6 + 1] = touchId;
             readReport.points[i * 6 + 2] = x & 0xFF;
@@ -2682,6 +2676,215 @@ SpbDeviceClose(
         WdfIoTargetClose(pDevice->SpbController);
     }
 }
+EVT_WDF_REQUEST_COMPLETION_ROUTINE SpbSyncCompletion;
+
+VOID
+SpbSyncCompletion(
+    _In_ WDFREQUEST Request,
+    _In_ WDFIOTARGET Target,
+    _In_ PWDF_REQUEST_COMPLETION_PARAMS CompletionParams,
+    _In_ WDFCONTEXT Context
+)
+{
+    UNREFERENCED_PARAMETER(Request);
+    UNREFERENCED_PARAMETER(Target);
+    UNREFERENCED_PARAMETER(CompletionParams);
+    KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
+}
+
+static NTSTATUS
+SpbDeviceSendAndWait(
+    _In_ PDEVICE_CONTEXT pDevice,
+    _In_ WDFREQUEST Request,
+    _In_ ULONG TimeoutMs
+)
+/*++
+  Send an already-formatted request to the SPB target and wait for its
+  completion with a bounded timeout. Each request uses its own slot event,
+  so a request that stays in flight after a timeout can never falsely wake
+  a later request's wait. On timeout the request is cancelled and, if the
+  cancellation also hangs, the slot is left occupied and the request object
+  is cleaned up when the SPB target is closed (its completion only touches
+  the device-lifetime slot event).
+--*/
+{
+    SPB_SYNC_SLOT* slot = NULL;
+    LARGE_INTEGER timeout;
+    LARGE_INTEGER cancelTimeout;
+    NTSTATUS status;
+    BOOLEAN sendStatus;
+    ULONG i;
+
+    //
+    // Allocate a slot. Only the serialized passive-level ISR calls this,
+    // so no locking is needed. If every slot is still held by a hung
+    // request, refuse the transfer.
+    //
+    for (i = 0; i < SPB_MAX_INFLIGHT; i++) {
+        if (!pDevice->SpbSlots[i].InUse) {
+            slot = &pDevice->SpbSlots[i];
+            slot->InUse = TRUE;
+            break;
+        }
+    }
+    if (slot == NULL) {
+        KdPrint(("GTX9886: no free SPB sync slot, dropping transfer\n"));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    KeClearEvent(&slot->Event);
+    WdfRequestSetCompletionRoutine(Request, SpbSyncCompletion, &slot->Event);
+
+    sendStatus = WdfRequestSend(Request, pDevice->SpbController, NULL);
+    if (!sendStatus) {
+        //
+        // Completed synchronously; the completion routine has already
+        // signaled the event. Release the slot and report the status.
+        //
+        slot->InUse = FALSE;
+        return WdfRequestGetStatus(Request);
+    }
+
+    timeout.QuadPart = -(LONGLONG)TimeoutMs * 1000 * 10;
+    status = KeWaitForSingleObject(
+        &slot->Event, Executive, KernelMode, FALSE, &timeout);
+    if (status == STATUS_TIMEOUT) {
+        KdPrint(("GTX9886: SPB transfer timed out after %lu ms, cancelling\n",
+            TimeoutMs));
+        (VOID)WdfRequestCancelSentRequest(Request);
+        cancelTimeout.QuadPart = -(LONGLONG)SPB_CANCEL_TIMEOUT_MS * 1000 * 10;
+        status = KeWaitForSingleObject(
+            &slot->Event, Executive, KernelMode, FALSE, &cancelTimeout);
+        if (status == STATUS_TIMEOUT) {
+            //
+            // Cancellation is hung as well. Leave the slot occupied and
+            // the request in flight; both are reclaimed when the SPB
+            // target is closed (device removal). The slot event stays
+            // valid for the completion routine because slots live in the
+            // device context.
+            //
+            return STATUS_IO_TIMEOUT;
+        }
+        slot->InUse = FALSE;
+        return STATUS_IO_TIMEOUT;
+    }
+
+    slot->InUse = FALSE;
+    return WdfRequestGetStatus(Request);
+}
+
+static NTSTATUS
+SpbDeviceWriteWithTimeout(
+    _In_ PDEVICE_CONTEXT pDevice,
+    _In_ PVOID pInputBuffer,
+    _In_ size_t inputBufferLength
+)
+{
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES memoryAttributes;
+    WDFMEMORY memory;
+    WDFREQUEST request;
+    NTSTATUS status;
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = pDevice->Device;
+
+    status = WdfRequestCreate(&attributes, pDevice->SpbController, &request);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&memoryAttributes);
+    memoryAttributes.ParentObject = request;
+
+    status = WdfMemoryCreatePreallocated(
+        &memoryAttributes,
+        pInputBuffer,
+        inputBufferLength,
+        &memory);
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(request);
+        return status;
+    }
+
+    status = WdfIoTargetFormatRequestForWrite(
+        pDevice->SpbController,
+        request,
+        memory,
+        NULL,
+        NULL);
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(request);
+        return status;
+    }
+
+    status = SpbDeviceSendAndWait(pDevice, request, SPB_TRANSFER_TIMEOUT_MS);
+    if (status == STATUS_IO_TIMEOUT) {
+        //
+        // The request may still be in flight; leave it for cleanup when
+        // the SPB target is closed.
+        //
+        return status;
+    }
+
+    WdfObjectDelete(request);
+    return status;
+}
+
+static NTSTATUS
+SpbDeviceReadWithTimeout(
+    _In_ PDEVICE_CONTEXT pDevice,
+    _In_ PVOID pOutputBuffer,
+    _In_ size_t outputBufferLength
+)
+{
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_OBJECT_ATTRIBUTES memoryAttributes;
+    WDFMEMORY memory;
+    WDFREQUEST request;
+    NTSTATUS status;
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = pDevice->Device;
+
+    status = WdfRequestCreate(&attributes, pDevice->SpbController, &request);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&memoryAttributes);
+    memoryAttributes.ParentObject = request;
+
+    status = WdfMemoryCreatePreallocated(
+        &memoryAttributes,
+        pOutputBuffer,
+        outputBufferLength,
+        &memory);
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(request);
+        return status;
+    }
+
+    status = WdfIoTargetFormatRequestForRead(
+        pDevice->SpbController,
+        request,
+        memory,
+        NULL,
+        NULL);
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(request);
+        return status;
+    }
+
+    status = SpbDeviceSendAndWait(pDevice, request, SPB_TRANSFER_TIMEOUT_MS);
+    if (status == STATUS_IO_TIMEOUT) {
+        return status;
+    }
+
+    WdfObjectDelete(request);
+    return status;
+}
+
 VOID
 SpbDeviceWrite(
     _In_ PDEVICE_CONTEXT pDevice,
@@ -2689,23 +2892,9 @@ SpbDeviceWrite(
     _In_ size_t inputBufferLength
 )
 {
-    WDF_MEMORY_DESCRIPTOR  inMemoryDescriptor;
-    ULONG_PTR  bytesWritten = (ULONG_PTR)NULL;
     NTSTATUS status;
 
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inMemoryDescriptor,
-        pInputBuffer,
-        (ULONG)inputBufferLength);
-
-    status = WdfIoTargetSendWriteSynchronously(
-        pDevice->SpbController,
-        NULL,
-        &inMemoryDescriptor,
-        NULL,
-        NULL,
-        &bytesWritten
-    );
-
+    status = SpbDeviceWriteWithTimeout(pDevice, pInputBuffer, inputBufferLength);
     if (!NT_SUCCESS(status))
     {
         KdPrint(("GTX9886: SpbDeviceWrite failed 0x%08X\n", status));
@@ -2721,44 +2910,16 @@ SpbDeviceWriteRead(
     _In_ size_t outputBufferLength
 )
 {
-    WDF_MEMORY_DESCRIPTOR  inMemoryDescriptor;
-    WDF_MEMORY_DESCRIPTOR  outMemoryDescriptor;
-    ULONG_PTR  bytesWritten = (ULONG_PTR)NULL;
-    ULONG_PTR  bytesRead = (ULONG_PTR)NULL;
     NTSTATUS status;
 
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inMemoryDescriptor,
-        pInputBuffer,
-        (ULONG)inputBufferLength);
-
-    status = WdfIoTargetSendWriteSynchronously(
-        pDevice->SpbController,
-        NULL,
-        &inMemoryDescriptor,
-        NULL,
-        NULL,
-        &bytesWritten
-    );
-
+    status = SpbDeviceWriteWithTimeout(pDevice, pInputBuffer, inputBufferLength);
     if (!NT_SUCCESS(status))
     {
         KdPrint(("GTX9886: SpbDeviceWriteRead (write) failed 0x%08X\n", status));
         return;
     }
 
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outMemoryDescriptor,
-        pOutputBuffer,
-        (ULONG)outputBufferLength);
-
-    status = WdfIoTargetSendReadSynchronously(
-        pDevice->SpbController,
-        NULL,
-        &outMemoryDescriptor,
-        NULL,
-        NULL,
-        &bytesRead
-    );
-
+    status = SpbDeviceReadWithTimeout(pDevice, pOutputBuffer, outputBufferLength);
     if (!NT_SUCCESS(status))
     {
         KdPrint(("GTX9886: SpbDeviceWriteRead (read) failed 0x%08X\n", status));
@@ -2792,6 +2953,7 @@ Return Value:
     UNICODE_STRING  yMaxName;
     NTSTATUS        queryStatus;
     ULONG           queryFailures = 0;
+    PDEVICE_CONTEXT deviceContext = GetDeviceContext(Device);
 
     status = WdfDeviceOpenRegistryKey(Device,
         PLUGPLAY_REGKEY_DEVICE,
@@ -2811,22 +2973,22 @@ Return Value:
 
         //
         // Query every value independently; missing values fall back to the
-        // compiled-in defaults. Count the failures so a partially populated
-        // registry does not go unnoticed.
+        // defaults set in EvtDeviceAdd. Count the failures so a partially
+        // populated registry does not go unnoticed.
         //
-        queryStatus = WdfRegistryQueryULong(hKey, &xRevertName, &XRevert);
+        queryStatus = WdfRegistryQueryULong(hKey, &xRevertName, &deviceContext->XRevert);
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
-        queryStatus = WdfRegistryQueryULong(hKey, &yRevertName, &YRevert);
+        queryStatus = WdfRegistryQueryULong(hKey, &yRevertName, &deviceContext->YRevert);
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
-        queryStatus = WdfRegistryQueryULong(hKey, &xYExchangeName, &XYExchange);
+        queryStatus = WdfRegistryQueryULong(hKey, &xYExchangeName, &deviceContext->XYExchange);
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
-        queryStatus = WdfRegistryQueryULong(hKey, &xMinName, &XMin);
+        queryStatus = WdfRegistryQueryULong(hKey, &xMinName, &deviceContext->XMin);
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
-        queryStatus = WdfRegistryQueryULong(hKey, &xMaxName, &XMax);
+        queryStatus = WdfRegistryQueryULong(hKey, &xMaxName, &deviceContext->XMax);
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
-        queryStatus = WdfRegistryQueryULong(hKey, &yMinName, &YMin);
+        queryStatus = WdfRegistryQueryULong(hKey, &yMinName, &deviceContext->YMin);
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
-        queryStatus = WdfRegistryQueryULong(hKey, &yMaxName, &YMax);
+        queryStatus = WdfRegistryQueryULong(hKey, &yMaxName, &deviceContext->YMax);
         if (!NT_SUCCESS(queryStatus)) queryFailures++;
 
         if (queryFailures != 0) {
@@ -2840,15 +3002,17 @@ Return Value:
         // patch and report packing), so reject bounds outside 1..4095
         // before they wrap around at runtime.
         //
-        if ((XMax < 1) || (XMax > 0x0FFF) ||
-            (YMax < 1) || (YMax > 0x0FFF) ||
-            (XMin > XMax) || (YMin > YMax)) {
+        if ((deviceContext->XMax < 1) || (deviceContext->XMax > 0x0FFF) ||
+            (deviceContext->YMax < 1) || (deviceContext->YMax > 0x0FFF) ||
+            (deviceContext->XMin > deviceContext->XMax) ||
+            (deviceContext->YMin > deviceContext->YMax)) {
             KdPrint(("GTX9886: invalid coordinate range (%lu..%lu, %lu..%lu), using defaults\n",
-                XMin, XMax, YMin, YMax));
-            XMin = 0;
-            XMax = 1080;
-            YMin = 0;
-            YMax = 2340;
+                deviceContext->XMin, deviceContext->XMax,
+                deviceContext->YMin, deviceContext->YMax));
+            deviceContext->XMin = 0;
+            deviceContext->XMax = 1080;
+            deviceContext->YMin = 0;
+            deviceContext->YMax = 2340;
             status = STATUS_INVALID_PARAMETER;
         }
 
