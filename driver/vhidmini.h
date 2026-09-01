@@ -52,14 +52,19 @@ typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 // Per-request synchronization slot for bounded-wait SPB transfers. Each
 // slot owns its event, so a request that stays in flight after a timeout
 // can never signal (and thereby falsely wake) a later request's wait.
-// Slots are only touched from the serialized passive-level ISR, so no
-// additional locking is needed.
+// The slot also owns the transfer buffer: buffers live here instead of on
+// the ISR stack so a hung in-flight request can never touch freed stack
+// memory. Slots are only touched from the serialized passive-level ISR,
+// so no additional locking is needed.
 //
-#define SPB_MAX_INFLIGHT 4
+#define SPB_MAX_INFLIGHT 8
+#define SPB_SLOT_BUFFER_SIZE 84
 
 typedef struct _SPB_SYNC_SLOT {
     KEVENT                  Event;
     BOOLEAN                 InUse;
+    WDFREQUEST              Request;
+    UCHAR                   Buffer[SPB_SLOT_BUFFER_SIZE];
 } SPB_SYNC_SLOT;
 
 typedef struct __declspec(align(2))
@@ -253,13 +258,13 @@ SpbDeviceClose(
 VOID
 SpbDeviceWrite(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ PVOID pInputBuffer,
+    _In_ const PVOID pInputBuffer,
     _In_ size_t inputBufferLength
 );
 VOID
 SpbDeviceWriteRead(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ PVOID pInputBuffer,
+    _In_ const PVOID pInputBuffer,
     _In_ PVOID pOutputBuffer,
     _In_ size_t inputBufferLength,
     _In_ size_t outputBufferLength

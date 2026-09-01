@@ -17,7 +17,7 @@ Environment:
 --*/
 #include "vhidmini.h"
 
-#ifdef DEBUG
+#ifdef DBG
 #include "kmdf/trace.h"
 #include "vhidmini.tmh"
 #endif
@@ -31,9 +31,9 @@ Environment:
 #define SPB_TRANSFER_TIMEOUT_MS   100
 #define SPB_CANCEL_TIMEOUT_MS     100
 
-BYTE gtx9886_get_pre_coor[2] = { 0x41, 0x00 };
-BYTE gtx9886_get_coor[2] = { 0x41, 0x0c };
-BYTE gtx9886_clean_coor[3] = { 0x41, 0x00, 0x00};
+const BYTE gtx9886_get_pre_coor[2] = { 0x41, 0x00 };
+const BYTE gtx9886_get_coor[2] = { 0x41, 0x0c };
+const BYTE gtx9886_clean_coor[3] = { 0x41, 0x00, 0x00};
 
 //
 // Transform one touch point from the panel coordinate space to the
@@ -422,7 +422,7 @@ const HID_REPORT_DESCRIPTOR G_DefaultReportDescriptor[] = {
     0x05, 0x0D,     // (GLOBAL) USAGE_PAGE         0x000D Digitizer Device Page
     0x09, 0x54,     //     (LOCAL)USAGE              0x000D0054 Contact Count(Dynamic Value)
     0x75, 0x08,     //     (GLOBAL)REPORT_SIZE        0x08 (8) Number of bits per field
-    0x25, 0x0A,     //     (GLOBAL)LOGICAL_MAXIMUM    0x08 (8)
+    0x25, 0x0A,     //     (GLOBAL)LOGICAL_MAXIMUM    0x0A (10)
     0x81, 0x02,     //     (MAIN)INPUT              0x00000002 (1 field x 8 bits) 0 = Data 1 = Variable 0 = Absolute 0 = NoWrap 0 = Linear 0 = PrefState 0 = NoNull 0 = NonVolatile 0 = Bitmap
     0x09, 0x55,     //     (LOCAL)USAGE              0x000D0055 Contact Count Maximum(Static Value)
     0xB1, 0x02,     //     (MAIN)FEATURE            0x00000002 (1 field x 8 bits) 0 = Data 1 = Variable 0 = Absolute 0 = NoWrap 0 = Linear 0 = PrefState 0 = NoNull 0 = NonVolatile 0 = Bitmap
@@ -432,7 +432,7 @@ const HID_REPORT_DESCRIPTOR G_DefaultReportDescriptor[] = {
 
 C_ASSERT(sizeof(G_DefaultReportDescriptor) == TOUCH_REPORT_DESCRIPTOR_SIZE);
 
-featureReport54_t features = {0x54,10};
+static const featureReport54_t features = {0x54,10};
 //
 // This is the default HID descriptor returned by the mini driver
 // in response to IOCTL_HID_GET_DEVICE_DESCRIPTOR. The size
@@ -488,7 +488,7 @@ Return Value:
     WDF_DRIVER_CONFIG       config;
     WDF_OBJECT_ATTRIBUTES driverAttributes;
     NTSTATUS                status;
-#ifdef DEBUG
+#ifdef DBG
     WPP_INIT_TRACING(DriverObject, RegistryPath);
 #endif
 #ifdef _KERNEL_MODE
@@ -521,7 +521,7 @@ EvtDriverCleanup(
     _In_ WDFOBJECT Object
 )
 {
-#ifdef DEBUG
+#ifdef DBG
     WPP_CLEANUP(WdfDriverWdmGetDriverObject((WDFDRIVER)Object));
 #else
     UNREFERENCED_PARAMETER(Object);
@@ -978,7 +978,15 @@ OnD0Exit(
         FALSE,
         &timeout);
     if (status == STATUS_TIMEOUT) {
+        //
+        // The delivery loop is wedged. Ask the framework to fail the
+        // device instead of tearing down objects a live loop may still
+        // be using; the framework completes pending requests and walks
+        // the normal removal path, which reclaims the hung state safely.
+        //
         KdPrint(("GTX9886: delivery loop did not drain within 5s\n"));
+        WdfDeviceSetFailed(pDevice->Device, WdfDeviceFailedNoRestart);
+        return STATUS_SUCCESS;
     }
     ClearTouchReports(pDevice);
     if (pDevice->SpbController != WDF_NO_HANDLE)
@@ -1432,8 +1440,11 @@ CacheTouchReportLocked(
 
     //
     // Lift frame: never drop it. Overwrite the most recent pure down slot,
-    // scanning from the tail towards (but never touching) the head. If
-    // every slot holds a lift frame, fall back to overwriting the tail.
+    // scanning from the tail towards (but never touching) the head. If the
+    // tail and middle slots are both lift frames, the head is the last
+    // candidate: sacrifice it when it is a pure down frame, and only fall
+    // back to overwriting the tail when every slot holds a lift frame
+    // (practically unreachable).
     //
     for (UCHAR back = 0; back < TOUCH_REPORT_SLOT_COUNT - 1; back++) {
         reportIndex = (QueueContext->PendingHead + TOUCH_REPORT_SLOT_COUNT - 1 - back) %
@@ -1442,6 +1453,14 @@ CacheTouchReportLocked(
             RtlCopyMemory(&QueueContext->PendingReports[reportIndex], Report, sizeof(*Report));
             return;
         }
+    }
+    if (!TouchReportHasLifted(&QueueContext->PendingReports[QueueContext->PendingHead])) {
+        //
+        // The head is a pure down frame and therefore droppable: replace it
+        // with the new lift instead of losing another lift frame.
+        //
+        RtlCopyMemory(&QueueContext->PendingReports[QueueContext->PendingHead], Report, sizeof(*Report));
+        return;
     }
     reportIndex = (QueueContext->PendingHead + TOUCH_REPORT_SLOT_COUNT - 1) %
         TOUCH_REPORT_SLOT_COUNT;
@@ -2385,11 +2404,11 @@ OnInterruptIsr(
     if (touch_count > 1) {
         SpbDeviceWriteRead(pDevice, gtx9886_get_coor, &allBuf[10],
             sizeof(gtx9886_get_coor),
-            BYTES_PER_COORD * (touch_count - 1) + BYTES_CHKSUM);
+            BYTES_PER_COORD * (touch_count - 1));
     }
 
     readReport.DIG_TouchScreenContactCount = touch_count;
-#ifdef DEBUG
+#ifdef DBG
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Point Buffer %x %x %x %x %x %x %x %x", preBuffer[0], preBuffer[1], preBuffer[2], preBuffer[3], preBuffer[4], preBuffer[5], preBuffer[6], preBuffer[7]);
 #endif
 
@@ -2413,7 +2432,7 @@ OnInterruptIsr(
             index++) {
             readReport.points[index * 6] = 0x04;
         }
-#ifdef DEBUG
+#ifdef DBG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "All points leave");
 #endif
         break;
@@ -2430,13 +2449,13 @@ OnInterruptIsr(
         readReport.points[4] = y & 0xFF;
         readReport.points[5] = (y >> 8) & 0x0F;
         readReport.DIG_TouchScreenContactCount = 1;
-#ifdef DEBUG
+#ifdef DBG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Point Enter X:%d, Y:%d", x, y);
 #endif
         break;
     default:
         // Remaining contacts were already read into allBuf above.
-#ifdef DEBUG
+#ifdef DBG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Multi Buffer %d %x %x %x %x %x %x %x", allBuf[0], allBuf[1], allBuf[2], allBuf[3], allBuf[4], allBuf[5]
             , allBuf[6], allBuf[7]);
 #endif
@@ -2454,7 +2473,7 @@ OnInterruptIsr(
             readReport.points[i * 6 + 3] = (x >> 8) & 0x0F;
             readReport.points[i * 6 + 4] = y & 0xFF;
             readReport.points[i * 6 + 5] = (y >> 8) & 0x0F;
-#ifdef DEBUG
+#ifdef DBG
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Multi %d X:%d, Y:%d", touchId, x, y);
 #endif
         }
@@ -2704,46 +2723,77 @@ SpbSyncCompletion(
     KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
 }
 
+static SPB_SYNC_SLOT*
+SpbDeviceAcquireSlot(
+    _In_ PDEVICE_CONTEXT pDevice
+)
+/*++
+  Allocate a sync slot. Only the serialized passive-level ISR calls this,
+  so no locking is needed. If every slot is held by a hung request, try to
+  reclaim one by cancelling its request with a bounded wait; if that also
+  fails, refuse the transfer.
+--*/
+{
+    LARGE_INTEGER timeout;
+    ULONG i;
+
+    for (i = 0; i < SPB_MAX_INFLIGHT; i++) {
+        if (!pDevice->SpbSlots[i].InUse) {
+            pDevice->SpbSlots[i].InUse = TRUE;
+            return &pDevice->SpbSlots[i];
+        }
+    }
+
+    //
+    // Every slot is held by a hung request. Attempt to cancel each one in
+    // turn; a request whose event fires within the cancel window has
+    // terminated and its slot can be reused.
+    //
+    for (i = 0; i < SPB_MAX_INFLIGHT; i++) {
+        SPB_SYNC_SLOT* slot = &pDevice->SpbSlots[i];
+        if (slot->Request == WDF_NO_HANDLE) {
+            continue;
+        }
+        (VOID)WdfRequestCancelSentRequest(slot->Request);
+        timeout.QuadPart = -(LONGLONG)SPB_CANCEL_TIMEOUT_MS * 1000 * 10;
+        if (KeWaitForSingleObject(&slot->Event, Executive, KernelMode, FALSE,
+                &timeout) != STATUS_TIMEOUT) {
+            //
+            // The hung request has terminated; its slot is reusable.
+            //
+            slot->Request = WDF_NO_HANDLE;
+            slot->InUse = TRUE;
+            return slot;
+        }
+    }
+
+    KdPrint(("GTX9886: all SPB sync slots hung, dropping transfer\n"));
+    return NULL;
+}
+
 static NTSTATUS
 SpbDeviceSendAndWait(
     _In_ PDEVICE_CONTEXT pDevice,
+    _In_ SPB_SYNC_SLOT* slot,
     _In_ WDFREQUEST Request,
     _In_ ULONG TimeoutMs
 )
 /*++
   Send an already-formatted request to the SPB target and wait for its
-  completion with a bounded timeout. Each request uses its own slot event,
-  so a request that stays in flight after a timeout can never falsely wake
-  a later request's wait. On timeout the request is cancelled and, if the
-  cancellation also hangs, the slot is left occupied and the request object
-  is cleaned up when the SPB target is closed (its completion only touches
-  the device-lifetime slot event).
+  completion with a bounded timeout. The request buffer lives in the slot,
+  so a request that stays in flight after a timeout can never touch freed
+  stack memory. The slot is released (and the completed request object
+  deleted) on every path except the one where cancellation also hangs;
+  there the slot stays occupied and the request is reclaimed when the SPB
+  target is closed at device removal.
 --*/
 {
-    SPB_SYNC_SLOT* slot = NULL;
     LARGE_INTEGER timeout;
     LARGE_INTEGER cancelTimeout;
     NTSTATUS status;
     BOOLEAN sendStatus;
-    ULONG i;
 
-    //
-    // Allocate a slot. Only the serialized passive-level ISR calls this,
-    // so no locking is needed. If every slot is still held by a hung
-    // request, refuse the transfer.
-    //
-    for (i = 0; i < SPB_MAX_INFLIGHT; i++) {
-        if (!pDevice->SpbSlots[i].InUse) {
-            slot = &pDevice->SpbSlots[i];
-            slot->InUse = TRUE;
-            break;
-        }
-    }
-    if (slot == NULL) {
-        KdPrint(("GTX9886: no free SPB sync slot, dropping transfer\n"));
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
+    slot->Request = Request;
     KeClearEvent(&slot->Event);
     WdfRequestSetCompletionRoutine(Request, SpbSyncCompletion, &slot->Event);
 
@@ -2751,10 +2801,13 @@ SpbDeviceSendAndWait(
     if (!sendStatus) {
         //
         // Completed synchronously; the completion routine has already
-        // signaled the event. Release the slot and report the status.
+        // signaled the event.
         //
+        slot->Request = WDF_NO_HANDLE;
         slot->InUse = FALSE;
-        return WdfRequestGetStatus(Request);
+        status = WdfRequestGetStatus(Request);
+        WdfObjectDelete(Request);
+        return status;
     }
 
     timeout.QuadPart = -(LONGLONG)TimeoutMs * 1000 * 10;
@@ -2770,25 +2823,28 @@ SpbDeviceSendAndWait(
         if (status == STATUS_TIMEOUT) {
             //
             // Cancellation is hung as well. Leave the slot occupied and
-            // the request in flight; both are reclaimed when the SPB
-            // target is closed (device removal). The slot event stays
-            // valid for the completion routine because slots live in the
-            // device context.
+            // the request in flight; both the slot buffer and the event
+            // live in the device context, so the late completion is safe.
             //
             return STATUS_IO_TIMEOUT;
         }
+        slot->Request = WDF_NO_HANDLE;
         slot->InUse = FALSE;
+        WdfObjectDelete(Request);
         return STATUS_IO_TIMEOUT;
     }
 
+    slot->Request = WDF_NO_HANDLE;
     slot->InUse = FALSE;
-    return WdfRequestGetStatus(Request);
+    status = WdfRequestGetStatus(Request);
+    WdfObjectDelete(Request);
+    return status;
 }
 
 static NTSTATUS
 SpbDeviceWriteWithTimeout(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ PVOID pInputBuffer,
+    _In_ const PVOID pInputBuffer,
     _In_ size_t inputBufferLength
 )
 {
@@ -2796,13 +2852,30 @@ SpbDeviceWriteWithTimeout(
     WDF_OBJECT_ATTRIBUTES memoryAttributes;
     WDFMEMORY memory;
     WDFREQUEST request;
+    SPB_SYNC_SLOT* slot;
     NTSTATUS status;
+
+    if (inputBufferLength > SPB_SLOT_BUFFER_SIZE) {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    slot = SpbDeviceAcquireSlot(pDevice);
+    if (slot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    //
+    // Copy the payload into the slot-owned buffer so the request never
+    // references caller (stack) memory beyond this function's lifetime.
+    //
+    RtlCopyMemory(slot->Buffer, pInputBuffer, inputBufferLength);
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.ParentObject = pDevice->Device;
 
     status = WdfRequestCreate(&attributes, pDevice->SpbController, &request);
     if (!NT_SUCCESS(status)) {
+        slot->InUse = FALSE;
         return status;
     }
 
@@ -2811,10 +2884,11 @@ SpbDeviceWriteWithTimeout(
 
     status = WdfMemoryCreatePreallocated(
         &memoryAttributes,
-        pInputBuffer,
+        slot->Buffer,
         inputBufferLength,
         &memory);
     if (!NT_SUCCESS(status)) {
+        slot->InUse = FALSE;
         WdfObjectDelete(request);
         return status;
     }
@@ -2826,21 +2900,12 @@ SpbDeviceWriteWithTimeout(
         NULL,
         NULL);
     if (!NT_SUCCESS(status)) {
+        slot->InUse = FALSE;
         WdfObjectDelete(request);
         return status;
     }
 
-    status = SpbDeviceSendAndWait(pDevice, request, SPB_TRANSFER_TIMEOUT_MS);
-    if (status == STATUS_IO_TIMEOUT) {
-        //
-        // The request may still be in flight; leave it for cleanup when
-        // the SPB target is closed.
-        //
-        return status;
-    }
-
-    WdfObjectDelete(request);
-    return status;
+    return SpbDeviceSendAndWait(pDevice, slot, request, SPB_TRANSFER_TIMEOUT_MS);
 }
 
 static NTSTATUS
@@ -2854,13 +2919,24 @@ SpbDeviceReadWithTimeout(
     WDF_OBJECT_ATTRIBUTES memoryAttributes;
     WDFMEMORY memory;
     WDFREQUEST request;
+    SPB_SYNC_SLOT* slot;
     NTSTATUS status;
+
+    if (outputBufferLength > SPB_SLOT_BUFFER_SIZE) {
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    slot = SpbDeviceAcquireSlot(pDevice);
+    if (slot == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.ParentObject = pDevice->Device;
 
     status = WdfRequestCreate(&attributes, pDevice->SpbController, &request);
     if (!NT_SUCCESS(status)) {
+        slot->InUse = FALSE;
         return status;
     }
 
@@ -2869,10 +2945,11 @@ SpbDeviceReadWithTimeout(
 
     status = WdfMemoryCreatePreallocated(
         &memoryAttributes,
-        pOutputBuffer,
+        slot->Buffer,
         outputBufferLength,
         &memory);
     if (!NT_SUCCESS(status)) {
+        slot->InUse = FALSE;
         WdfObjectDelete(request);
         return status;
     }
@@ -2884,23 +2961,32 @@ SpbDeviceReadWithTimeout(
         NULL,
         NULL);
     if (!NT_SUCCESS(status)) {
+        slot->InUse = FALSE;
         WdfObjectDelete(request);
         return status;
     }
 
-    status = SpbDeviceSendAndWait(pDevice, request, SPB_TRANSFER_TIMEOUT_MS);
-    if (status == STATUS_IO_TIMEOUT) {
+    status = SpbDeviceSendAndWait(pDevice, slot, request, SPB_TRANSFER_TIMEOUT_MS);
+    if (!NT_SUCCESS(status)) {
+        //
+        // Timed out (data invalid) or failed; on success the slot buffer
+        // holds the payload.
+        //
         return status;
     }
 
-    WdfObjectDelete(request);
+    //
+    // Copy the payload out of the slot buffer. The request has already
+    // been completed and deleted by SpbDeviceSendAndWait.
+    //
+    RtlCopyMemory(pOutputBuffer, slot->Buffer, outputBufferLength);
     return status;
 }
 
 VOID
 SpbDeviceWrite(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ PVOID pInputBuffer,
+    _In_ const PVOID pInputBuffer,
     _In_ size_t inputBufferLength
 )
 {
@@ -2916,7 +3002,7 @@ SpbDeviceWrite(
 VOID
 SpbDeviceWriteRead(
     _In_ PDEVICE_CONTEXT pDevice,
-    _In_ PVOID pInputBuffer,
+    _In_ const PVOID pInputBuffer,
     _In_ PVOID pOutputBuffer,
     _In_ size_t inputBufferLength,
     _In_ size_t outputBufferLength

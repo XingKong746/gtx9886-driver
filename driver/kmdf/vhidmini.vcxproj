@@ -259,11 +259,11 @@
     <ClCompile Include="..\vhidmini.c">
       <WppEnabled Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">true</WppEnabled>
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
-      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">Trace(LEVEL,FLAGS,MSG,...)</WppTraceFunction>
+      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'"></WppTraceFunction>
     </ClCompile>
     <ClCompile Include="util.c">
       <WppEnabled Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">true</WppEnabled>
-      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">Trace(LEVEL,FLAGS,MSG,...)</WppTraceFunction>
+      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'"></WppTraceFunction>
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
     </ClCompile>
     <ResourceCompile Include="vhidmini.rc" />
